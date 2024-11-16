@@ -1,0 +1,17 @@
+repositories:
+  control_msgs:
+    type: git
+    url: git@github.com:RRC-Control-Lab/control_msgs.git
+    version: feat/asmc
+  control_toolbox:
+    type: git
+    url: git@github.com:RRC-Control-Lab/control_toolbox.git
+    version: feat/asmc
+  joint_trajectory_controller_asmc:
+    type: git
+    url: git@github.com:RRC-Control-Lab/joint_trajectory_controller_asmc.git
+    version: feat/asmc
+  gz_ros2_control:
+    type: git
+    url: git@github.com:mittechteam/gz_ros2_control.git
+    version: v10.0.0
