@@ -1,0 +1,9 @@
+ros-humble-plotjuggler-ros
+ros-humble-xacro
+ros-humble-rosbag2-storage-mcap
+ros-humble-diagnostic-updater
+ros-humble-usb-cam
+libpcap0.8-dev
+iproute2
+can-utils
+net-tools
