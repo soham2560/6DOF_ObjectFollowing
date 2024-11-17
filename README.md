@@ -28,7 +28,7 @@ The aim is to track the trajectory of a flying object using a 6DoF Manipulator w
 ## Common Commands
 - Launch
     ```bash
-    ros2 launch robot_bringup robot.launch.py
+    ros2 launch robot_bringup robot.launch.py use_rviz:=True
     ```
 
 - Sample Command
