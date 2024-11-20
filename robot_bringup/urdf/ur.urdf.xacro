@@ -21,6 +21,7 @@
   <xacro:arg name="safety_limits" default="False"/>
   <xacro:arg name="safety_pos_margin" default="0.015"/>
   <xacro:arg name="safety_k_position" default="20.0"/>
+  <xacro:property name="PI" value="3.1415926535897931"/>
 
   <!--When using gazebo simulations absolute paths are necessary.-->
   <xacro:arg name="force_abs_paths" default="true" />
@@ -42,7 +43,7 @@
     safety_k_position="$(arg safety_k_position)"
     force_abs_paths="$(arg force_abs_paths)"
     >
-    <origin xyz="0 0 2" rpy="0 0 0" />          <!-- position robot in the world -->
+    <origin xyz="0 0 2" rpy="0 0 ${PI}" />          <!-- position robot in the world -->
   </xacro:ur_robot>
 
   <ros2_control name="ur5" type="system">
@@ -98,7 +99,11 @@
           <state_interface name="effort"/>
       </joint>
   </ros2_control>
+  
 
+  <disable_collisions link1="upper_arm_link" link2="wrist_1_link" reason="intentionally disabled" />
+  <disable_collisions link1="upper_arm_link" link2="wrist_2_link" reason="intentionally disabled" />
+  <disable_collisions link1="upper_arm_link" link2="wrist_3_link" reason="intentionally disabled" />
   <gazebo>
       <plugin filename="gz_ros2_control-system" name="gz_ros2_control::GazeboSimROS2ControlPlugin">
           <parameters>$(arg yaml_path)</parameters>

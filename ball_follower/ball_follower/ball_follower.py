@@ -3,6 +3,8 @@
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float64MultiArray
+from geometry_msgs.msg import Point
+from visualization_msgs.msg import Marker
 from sensor_msgs.msg import JointState
 import numpy as np
 from math import *
@@ -16,6 +18,19 @@ class CartesianState:
     position: np.ndarray
     velocity: np.ndarray
 
+def tm(yeehaw):
+    x, y, z, r, p, yaw = yeehaw
+    # Rotation matrix for roll (r), pitch (p), and yaw (yaw)
+    R = np.array([
+        [np.cos(yaw) * np.cos(p), np.cos(yaw) * np.sin(p) * np.sin(r) - np.sin(yaw) * np.cos(r), np.cos(yaw) * np.sin(p) * np.cos(r) + np.sin(yaw) * np.sin(r)],
+        [np.sin(yaw) * np.cos(p), np.sin(yaw) * np.sin(p) * np.sin(r) + np.cos(yaw) * np.cos(r), np.sin(yaw) * np.sin(p) * np.cos(r) - np.cos(yaw) * np.sin(r)],
+        [-np.sin(p), np.cos(p) * np.sin(r), np.cos(p) * np.cos(r)]
+    ])
+    # Transformation matrix: [Rotation | Translation]
+    T = np.eye(4)
+    T[:3, :3] = R  # Set the rotation part
+    T[:3, 3] = [x, y, z]  # Set the translation part
+    return T
 def invTransform(Transform):
     T = np.matrix(Transform)
     R = T[0:3,0:3]
@@ -63,8 +78,38 @@ class InverseKinematicsUR5:
         self.theta3 = np.zeros((2,2,2))
         self.flags3 = None
         self.theta4 = np.zeros((2,2,2))
+        self.debug = False
+
+        self.workspace_bounds = {
+            "x": (-0.5, 0.5),
+            "y": (-0.5, 0.5),
+            "z": (-5.0, 7.0),
+        }
+
+    def enableDebugMode(self, debug = True):
+        # This function will enable/disable debug mode
+        self.debug = debug
+
+    def setJointLimits(self, limit_min, limit_max):
+        # This function is used to set the joint limit for all joint
+        self.limit_max = limit_max
+        self.limit_min = limit_min
+
+    def setJointWeights(self, weights):
+        # This function will assign weights list for each joint
+        self.joint_weight = np.array(weights)
+
+    def setEERotationOffset(self,r_offset_3x3):
+        # This function will assign rotation offset to the ee. r_offset_3x3 should be a numpy array
+        self.ee_offset[0:3,0:3] = r_offset_3x3
+
+    def setEERotationOffsetROS(self):
+        # This function will assign proper tool orientation offset for ROS ur5's urdf.
+        r_offset_3x3 = np.array( [[ 0, 0, 1],[-1, 0, 0],[ 0,-1, 0]] )
+        self.setEERotationOffset(r_offset_3x3)
 
     def normalize(self,value):
+        # This function will normalize the joint values according to the joint limit parameters
         normalized = value
         while normalized > self.limit_max:
             normalized -= 2 * pi
@@ -73,54 +118,79 @@ class InverseKinematicsUR5:
         return normalized
 
     def getFlags(self,nominator,denominator):
+        # This function is used to check whether the joint value will be valid or not
         if denominator == 0:
             return False
         return abs(nominator/denominator) < 1.01
 
     def getTheta1(self):
+        # This function will solve joint 1
         self.flags1 = np.ones(2)
 
         p05 = self.gd.dot(np.array([0,0,-self.d[5],1]))-np.array([0,0,0,1])
         psi = atan2(p05[1],p05[0])
 
         L = sqrt(p05[0]**2+p05[1]**2)
+
+        # gives tolerance if acos just a little bit bigger than 1 to return
+        # real result, otherwise the solution will be flagged as invalid
         if abs(self.d[3]) > L:
-            self.flags1[:] = self.getFlags(self.d[3],L)
+            if self.debug:
+                print('L1 = ', L, ' denominator = ', self.d[3])
+            self.flags1[:] = self.getFlags(self.d[3],L) # false if the ratio > 1.001
             L = abs(self.d[3])
         phi = acos(self.d[3]/L)
 
         self.theta1[0] = self.normalize(psi+phi+pi/2)
         self.theta1[1] = self.normalize(psi-phi+pi/2)
+
+        # stop the program early if no solution is possible
         self.stop_flag = not np.any(self.flags1)
+        if self.debug:
+            print('t1: ', self.theta1)
+            print('flags1: ',self.flags1)
     
     def getTheta5(self):
+        # This function will solve joint 5
         self.flags5 = np.ones((2,2))
 
         p06 = self.gd[0:3,3]
         for i in range(2):
-            p16z = p06[0]*sin(self.theta1[i])-p06[1]*cos(self.theta1[i]);
+            p16z = p06[0]*sin(self.theta1[i])-p06[1]*cos(self.theta1[i])
             L = self.d[5]
 
             if abs(p16z - self.d[3]) > L:
+                if self.debug:
+                    print('L5 = ', L, ' denominator = ', abs(p16z - self.d[3]))
                 self.flags5[i,:] = self.getFlags(p16z - self.d[3],self.d[5])
-                L = abs(p16z-self.d[3]);
+                L = abs(p16z-self.d[3])
             theta5i = acos((p16z-self.d[3])/L)
             self.theta5[i,0] = theta5i
             self.theta5[i,1] = -theta5i
+
+        # stop the program early if no solution is possible
         self.stop_flag = not np.any(self.flags5)
+        if self.debug:
+            print('t5: ', self.theta5)
+            print('flags5: ',self.flags5)
 
     def getTheta6(self):
+        # This function will solve joint 6
         for i in range(2):
             T1 = transformDHParameter(self.a[0],self.d[0],self.alpha[0],self.theta1[i])
             T61 = invTransform(invTransform(T1).dot(self.gd))
             for j in range(2):
                 if sin(self.theta5[i,j]) == 0:
+                    if self.debug:
+                        print("Singular case. selected theta 6 = 0")
                     self.theta6[i,j] = 0
                 else:
                     self.theta6[i,j] = atan2(-T61[1,2]/sin(self.theta5[i,j]),
                                               T61[0,2]/sin(self.theta5[i,j]))
+        # # print 't6: ', self.theta6
 
     def getTheta23(self):
+        # This function will solve joint 2 and 3
         self.flags3 = np.ones ((2,2,2))
         for i in range(2):
             T1 = transformDHParameter(self.a[0],self.d[0],self.alpha[0],self.theta1[i])
@@ -135,15 +205,24 @@ class InverseKinematicsUR5:
                 L = P13.dot(P13.transpose()) - self.a[1]**2 - self.a[2]**2
 
                 if abs(L / (2*self.a[1]*self.a[2]) ) > 1:
+                    if self.debug:
+                        print('L3 = ', L, ' denominator = ', (2*self.a[1]*self.a[2]))
                     self.flags3[i,j,:] = self.getFlags(L,2*self.a[1]*self.a[2])
                     L = np.sign(L) * 2*self.a[1]*self.a[2]
                 self.theta3[i,j,0] = acos(L / (2*self.a[1]*self.a[2]) )
                 self.theta2[i,j,0] = -atan2(P13[1],-P13[0]) + asin( self.a[2]*sin(self.theta3[i,j,0])/np.linalg.norm(P13) )
                 self.theta3[i,j,1] = -self.theta3[i,j,0]
                 self.theta2[i,j,1] = -atan2(P13[1],-P13[0]) + asin( self.a[2]*sin(self.theta3[i,j,1])/np.linalg.norm(P13) )
+        if self.debug:
+            print('t2: ', self.theta2)
+            print('t3: ', self.theta3)
+            print('flags3: ',self.flags3)
+
+        # stop the program early if no solution is possible
         self.stop_flag = not np.any(self.flags3)
     
     def getTheta4(self):
+        # This function will solve joint 4 value
         for i in range(2):
             T1 = transformDHParameter(self.a[0],self.d[0],self.alpha[0],self.theta1[i])
             T16 = invTransform(T1).dot(self.gd)
@@ -158,8 +237,11 @@ class InverseKinematicsUR5:
                           transformDHParameter(self.a[2],self.d[2],self.alpha[2],self.theta3[i,j,k]) )
                     T34 = invTransform(T13).dot(T14)
                     self.theta4[i,j,k] = atan2(T34[1,0],T34[0,0])
+        if self.debug:
+            print('t4: ', self.theta4)
 
     def countValidSolution(self):
+        # This function will count the number of available valid solutions
         number_of_solution = 0
         for i in range(2):
             for j in range(2):
@@ -169,6 +251,7 @@ class InverseKinematicsUR5:
         return number_of_solution
 
     def getSolution(self):
+        # This function will call all function to get all of the joint solutions
         for i in range(4):
             if i == 0:
                 self.getTheta1()
@@ -179,14 +262,20 @@ class InverseKinematicsUR5:
                 self.getTheta23()
             elif i == 3:
                 self.getTheta4()
+
+            # This will stop the solving the IK when there is no valid solution from previous joint calculation
             if self.stop_flag:
                 return
 
     def solveIK(self,forward_kinematics):
         self.gd = forward_kinematics.dot(self.ee_offset)
+        if self.debug:
+            print('Input to IK:\n', self.gd)
         self.getSolution()
         number_of_solution = self.countValidSolution()
         if self.stop_flag or number_of_solution < 1:
+            if self.debug:
+                print('No solution')
             return None
 
         Q = np.zeros((number_of_solution,6))
@@ -195,6 +284,7 @@ class InverseKinematicsUR5:
             for j in range(2):
                 for k in range(2):
                     if not (self.flags1[i] and self.flags3[i,j,k] and self.flags5[i,j]):
+                        # skip invalid solution
                         continue
                     Q[index,0] = self.normalize(self.theta1[i])
                     Q[index,1] = self.normalize(self.theta2[i,j,k])
@@ -203,17 +293,24 @@ class InverseKinematicsUR5:
                     Q[index,4] = self.normalize(self.theta5[i,j])
                     Q[index,5] = self.normalize(self.theta6[i,j])
                     index += 1
+
+        if self.debug:
+            print('Number of solution: ', number_of_solution)
+            print(Q)
+
         return Q
 
-    def findClosestIK(self,forward_kinematics,current_joint_configuration, logger):
+    def findClosestIK(self,forward_kinematics,current_joint_configuration):
         current_joint = np.array(current_joint_configuration)
         Q = self.solveIK(forward_kinematics)
-        logger.info(f"\n{Q.round(4)}\n") 
         if Q is not None:
             delta_Q = np.absolute(Q - current_joint) * self.joint_weights
             delta_Q_weights = np.sum(delta_Q, axis=1)
             closest_ik_index = np.argmin(delta_Q_weights, axis = 0)
-            logger.info(f"\n Choosing {Q[closest_ik_index,:].round(4)}\n")
+
+            if self.debug:
+                print('delta_Q weights for each solutions:', delta_Q_weights)
+                print('Closest IK solution: ', Q[closest_ik_index,:])
             return Q[closest_ik_index,:]
         else:
             return None
@@ -305,6 +402,13 @@ class InverseKinematicsUR5:
         JTJ_inv = np.linalg.pinv(JTJ)
         J_pseudo_inv = np.dot(JTJ_inv, J.T)
         return J_pseudo_inv
+    def is_within_workspace(self,pose):
+        x, y, z = pose
+        return ( 
+            self.workspace_bounds["x"][0] <= x <= self.workspace_bounds["x"][1] and
+            self.workspace_bounds["y"][0] <= y <= self.workspace_bounds["y"][1] and
+            self.workspace_bounds["z"][0] <= z <= self.workspace_bounds["z"][1]
+        )
 
 class RobotArmNode(Node):
     def __init__(self, file_path):
@@ -312,6 +416,9 @@ class RobotArmNode(Node):
         self.joint_limits = [(-2 * pi, 2 * pi) for _ in range(6)]
         self.publisher = self.create_publisher(Float64MultiArray, '/ur/arm_controller/commands', 10)
         self.joint_state_sub = self.create_subscription(JointState, '/ur/joint_states', self.joint_state_callback, 10)
+        self.trajectory_pub = self.create_publisher(Marker, '/end_effector_trajectory', 10)  # New Publisher
+        self.current_point_pub = self.create_publisher(Marker, '/current_point', 10)  # New publisher for current point
+        self.current_joint_positions = [0.0] * 6
         self.current_joint_positions = [0.0] * 6
         self.current_joint_velocities = [0.0] * 6
         self.ur5 = InverseKinematicsUR5()
@@ -320,10 +427,75 @@ class RobotArmNode(Node):
         self.trajectory = []
         self.get_logger().info("Initializing RobotArmNode")
         self.ik_solution = np.zeros(6)
-        if self.read_trajectory_file(file_path):
+        self.counter = 0
+        
+        if self.read_trajectory_file("/ros2_ws/src/parabolic_trajectory.csv"):
             self.get_logger().info("Trajectory file loaded")
             self.timer = self.create_timer(0.01, self.timer_callback)
             self.start_time = self.get_clock().now()
+            self.publish_trajectory()
+
+    def publish_trajectory(self):
+        marker = Marker()
+        marker.header.frame_id = "world"  # Use the correct frame ID
+        marker.header.stamp = self.get_clock().now().to_msg()
+        marker.ns = "trajectory"
+        marker.id = 0
+        marker.type = Marker.LINE_STRIP  # Line strip for trajectory visualization
+        marker.action = Marker.ADD
+        marker.scale.x = 0.01  # Line width
+        marker.color.a = 1.0  # Alpha (transparency)
+        marker.color.r = 0.0  # Red
+        marker.color.g = 1.0  # Green
+        marker.color.b = 0.0  # Blue
+
+        # Convert trajectory points to geometry_msgs/Point and add them
+        for state in self.trajectory:
+            point = Point()
+            point.x = state.position[0]
+            point.y = state.position[1]
+            point.z = state.position[2]+2
+            marker.points.append(point)
+
+        # Publish the marker
+        self.trajectory_pub.publish(marker)
+        self.get_logger().info("End-effector trajectory published for visualization")
+
+    def publish_current_point(self):
+        # Publish current point marker
+        marker = Marker()
+        marker.header.frame_id = "world"
+        marker.header.stamp = self.get_clock().now().to_msg()
+        marker.ns = "current_point"
+        marker.id = 1
+        marker.type = Marker.SPHERE
+        marker.action = Marker.ADD
+        
+        # Make the current point marker larger and red
+        marker.scale.x = 0.05
+        marker.scale.y = 0.05
+        marker.scale.z = 0.05
+        marker.color.a = 1.0
+        marker.color.r = 1.0
+        marker.color.g = 0.0
+        marker.color.b = 0.0
+
+        # Set the position to current trajectory point
+        if self.current_point_index < len(self.trajectory):
+            current_state = self.trajectory[self.current_point_index]
+            marker.pose.position.x = current_state.position[0]
+            marker.pose.position.y = current_state.position[1]
+            marker.pose.position.z = current_state.position[2]+2
+
+        self.current_point_pub.publish(marker)
+
+    def destroy_node(self):
+        # Add your shutdown behavior here
+        msg = Float64MultiArray()
+        msg.data = np.zeros(6).tolist()
+        self.publisher.publish(msg)
+        self.get_logger().info('Node is shutting down, performing cleanup...')
+        # Cleanup code goes here, like stopping timers, releasing resources, etc.
 
     def joint_state_callback(self, msg):
         self.get_logger().debug("Received joint state message")
@@ -374,37 +546,62 @@ class RobotArmNode(Node):
             return
         if self.current_point_index >= len(self.trajectory):
             self.get_logger().info("Trajectory completed")
-            self.timer.cancel()
+            msg = Float64MultiArray()
+            msg.data = np.zeros(6).tolist()
+            self.publisher.publish(msg)
+            self.get_logger().info(f"\nCurrent Point Index:{self.current_point_index}")
             return
+        self.counter += 1
+        if(self.counter>100):
+            # self.current_point_index += 1
+            self.counter = 000000000000000000000000        
         point = self.trajectory[self.current_point_index]
+
+        self.publish_current_point()
+        if not self.ur5.is_within_workspace(point.position):
+            print(f"Pose {point.position} is outside the workspace. Computation skipped.")
+            self.current_point_index += 1
+            return None
         elapsed = (self.get_clock().now() - self.start_time).nanoseconds / 1e9
         if elapsed >= point.timestamp:
             if np.any(np.isnan(point.position)) or np.any(np.isnan(point.velocity)):
                 self.get_logger().warn(f"Invalid Cartesian data at index {self.current_point_index}")
                 self.current_point_index += 1
+                self.get_logger().info(f"\nCurrents Point Index:{self.current_point_index}")
                 return
-            
-            transformation_matrix = transformRobotParameter(np.concatenate([point.position, np.zeros(3)]))
-            self.ik_solution = self.ur5.findClosestIK(np.array(transformation_matrix),self.current_joint_positions,self.get_logger())
+            temp = np.concatenate([point.position, [0,0,0]])
+            transformation_matrix = tm(temp)
+            self.ik_solution = self.ur5.findClosestIK(np.array(transformation_matrix),self.current_joint_positions)
         if self.ik_solution is not None:
             if self.validate_joint_positions(self.ik_solution):
                 J = self.ur5.compute_jacobian_analytical(self.ik_solution)
                 Jv = J[:3, :]
                 Jv_pseudo_inverse = self.ur5.compute_pseudo_inverse(Jv)
-                velocity_array = np.array((point.position - transformRobotParameter(self.current_joint_positions)[0:3,3])*0.1)
-                joint_velocity = np.dot(Jv_pseudo_inverse, velocity_array)
+                velocity_array = np.array(-(point.position - transformRobotParameter(self.current_joint_positions)[0:3,3]))
+                joint_velocity = (np.dot(Jv_pseudo_inverse, velocity_array))
 
+                self.get_logger().info(f"\npos:{point.position}")
+                self.get_logger().info(f"\ntrans:{transformRobotParameter(self.current_joint_positions)[0:3,3]}")
                 msg = Float64MultiArray()
-                msg.data = joint_velocity.tolist()
+                msg.data = self.ik_solution.tolist()
                 self.publisher.publish(msg)
+
+                self.get_logger().info(f"Distance to goal: {np.linalg.norm((point.position - transformRobotParameter(self.current_joint_positions)[0:3,3]))}")
+            self.get_logger().info(f"\nCurrent Point Index:{self.current_point_index}")
         else:
-            self.get_logger().warn(f"Invalid joint solution at index {self.current_point_index}")
-        if(np.linalg.norm((point.position - transformRobotParameter(self.current_joint_positions)[0:3,3]))<0.01):
+            self.get_logger().info(f"Invalid joint solution at index {self.current_point_index}")
+            # self.current_point_index += 1
+        if(np.linalg.norm((point.position - transformRobotParameter(self.current_joint_positions)[0:3,3]))<0.1):
             self.current_point_index += 1
+            self.get_logger().info(f"\nCurrent Point Index:{self.current_point_index}")
 
 def main():
     rclpy.init()
     node = RobotArmNode('src/parabolic_trajectory.csv')
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()  # Calls the custom destroy_node method
+        rclpy.shutdown()
