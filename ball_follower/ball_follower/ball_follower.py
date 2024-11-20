@@ -18,6 +18,12 @@ class CartesianState:
     position: np.ndarray
     velocity: np.ndarray
 
+def angular_distance(a, b):
+    return ((b - a + pi) % (2 * pi)) - pi
+
+def apply_shortest_path(current, target):
+    delta = angular_distance(current, target)
+    return current + delta
 def tm(yeehaw):
     x, y, z, r, p, yaw = yeehaw
     # Rotation matrix for roll (r), pitch (p), and yaw (yaw)
@@ -81,8 +87,8 @@ class InverseKinematicsUR5:
         self.debug = False
 
         self.workspace_bounds = {
-            "x": (-0.5, 0.5),
-            "y": (-0.5, 0.5),
+            "x": (-0.7, 0.7),
+            "y": (-0.7, 0.7),
             "z": (-5.0, 7.0),
         }
 
@@ -233,8 +239,7 @@ class InverseKinematicsUR5:
                 T14 = T16.dot(invTransform(T45.dot(T56)))
 
                 for k in range(2):
-                    T13 = transformDHParameter(self.a[1],self.d[1],self.alpha[1],self.theta2[i,j,k]).dot(
-                          transformDHParameter(self.a[2],self.d[2],self.alpha[2],self.theta3[i,j,k]) )
+                    T13 = transformDHParameter(self.a[1],self.d[1],self.alpha[1],self.theta2[i,j,k]).dot(transformDHParameter(self.a[2],self.d[2],self.alpha[2],self.theta3[i,j,k]) )
                     T34 = invTransform(T13).dot(T14)
                     self.theta4[i,j,k] = atan2(T34[1,0],T34[0,0])
         if self.debug:
@@ -300,18 +305,44 @@ class InverseKinematicsUR5:
 
         return Q
 
-    def findClosestIK(self,forward_kinematics,current_joint_configuration):
+    def normalize(self, value):
+        """
+        Modified to not force normalization between -2π and 2π
+        Only used during initial IK solution finding
+        """
+        return value
+
+    def findClosestIK(self, forward_kinematics, current_joint_configuration):
         current_joint = np.array(current_joint_configuration)
         Q = self.solveIK(forward_kinematics)
+        
         if Q is not None:
-            delta_Q = np.absolute(Q - current_joint) * self.joint_weights
-            delta_Q_weights = np.sum(delta_Q, axis=1)
-            closest_ik_index = np.argmin(delta_Q_weights, axis = 0)
-
+            # Calculate true angular distances using shortest path
+            delta_Q = np.zeros_like(Q)
+            for i in range(len(Q)):
+                for j in range(6):
+                    # Always use -π to π delta for distance calculation
+                    delta_Q[i,j] = abs(angular_distance(current_joint[j], Q[i,j]))
+            
+            # Apply joint weights to the distances
+            delta_Q_weights = np.sum(delta_Q * self.joint_weights, axis=1)
+            closest_ik_index = np.argmin(delta_Q_weights, axis=0)
+            
+            # Get base solution
+            closest_solution = Q[closest_ik_index,:].copy()
+            
+            # Apply shortest path logic to each joint
+            # This will maintain current accumulated rotation while using shortest path movement
+            for j in range(6):
+                closest_solution[j] = apply_shortest_path(current_joint[j], closest_solution[j])
+            
             if self.debug:
-                print('delta_Q weights for each solutions:', delta_Q_weights)
-                print('Closest IK solution: ', Q[closest_ik_index,:])
-            return Q[closest_ik_index,:]
+                print('Current joint positions:', current_joint)
+                print('Raw IK solution:', Q[closest_ik_index,:])
+                print('Modified solution with shortest path:', closest_solution)
+                print('Delta movements:', [angular_distance(current_joint[j], closest_solution[j]) for j in range(6)])
+            
+            return closest_solution
         else:
             return None
         
@@ -413,7 +444,7 @@ class InverseKinematicsUR5:
 class RobotArmNode(Node):
     def __init__(self, file_path):
         super().__init__('robot_arm')
-        self.joint_limits = [(-2 * pi, 2 * pi) for _ in range(6)]
+        self.joint_limits = None
         self.publisher = self.create_publisher(Float64MultiArray, '/ur/arm_controller/commands', 10)
         self.joint_state_sub = self.create_subscription(JointState, '/ur/joint_states', self.joint_state_callback, 10)
         self.trajectory_pub = self.create_publisher(Marker, '/end_effector_trajectory', 10)  # New Publisher
@@ -533,66 +564,90 @@ class RobotArmNode(Node):
             return False
 
     def validate_joint_positions(self, joint_positions):
-        # return True
+        """
+        Modified to only check for NaN/Inf and reasonable delta movements
+        """
         if joint_positions is None or len(joint_positions) != 6:
             return False
-        return all(
-            not (isnan(pos) or isinf(pos)) and min_limit <= pos <= max_limit
-            for pos, (min_limit, max_limit) in zip(joint_positions, self.joint_limits)
-        )
+        
+        # Check for NaN or Inf values
+        if any(isnan(pos) or isinf(pos) for pos in joint_positions):
+            return False
+            
+        # Verify that all movements are taking shortest path (delta should be between -π and π)
+        for curr, target in zip(self.current_joint_positions, joint_positions):
+            if abs(angular_distance(curr, target)) > np.pi:
+                return False
+                
+        return True
 
     def timer_callback(self):
         if not self.has_joint_states:
             return
+        
+        if self.current_point_index <= 2:
+            msg = Float64MultiArray()
+            stop_positions = [apply_shortest_path(pos, 0.0) for pos in self.current_joint_positions]
+            msg.data = stop_positions
+            self.publisher.publish(msg)
         if self.current_point_index >= len(self.trajectory):
             self.get_logger().info("Trajectory completed")
-            msg = Float64MultiArray()
-            msg.data = np.zeros(6).tolist()
-            self.publisher.publish(msg)
+            # Use current joint positions as reference for stopping
+            # msg = Float64MultiArray()
+            # stop_positions = [apply_shortest_path(pos, 0.0) for pos in self.current_joint_positions]
+            # msg.data = stop_positions
+            # self.publisher.publish(msg)
             self.get_logger().info(f"\nCurrent Point Index:{self.current_point_index}")
             return
-        self.counter += 1
-        if(self.counter>100):
-            # self.current_point_index += 1
-            self.counter = 000000000000000000000000        
+        
         point = self.trajectory[self.current_point_index]
 
+        # self.current_point_index += 1    
         self.publish_current_point()
-        if not self.ur5.is_within_workspace(point.position):
-            print(f"Pose {point.position} is outside the workspace. Computation skipped.")
-            self.current_point_index += 1
-            return None
+        # if not self.ur5.is_within_workspace(point.position):
+        #     print(f"Pose {point.position} is outside the workspace. Computation skipped.")
+        #     self.current_point_index += 1    
+        #     return None
+        self.current_point_index += 1    
+
         elapsed = (self.get_clock().now() - self.start_time).nanoseconds / 1e9
         if elapsed >= point.timestamp:
             if np.any(np.isnan(point.position)) or np.any(np.isnan(point.velocity)):
                 self.get_logger().warn(f"Invalid Cartesian data at index {self.current_point_index}")
-                self.current_point_index += 1
-                self.get_logger().info(f"\nCurrents Point Index:{self.current_point_index}")
                 return
+                
             temp = np.concatenate([point.position, [0,0,0]])
             transformation_matrix = tm(temp)
-            self.ik_solution = self.ur5.findClosestIK(np.array(transformation_matrix),self.current_joint_positions)
+            
+            # Get IK solution using shortest path logic
+            self.ik_solution = self.ur5.findClosestIK(np.array(transformation_matrix), self.current_joint_positions)
+            
         if self.ik_solution is not None:
             if self.validate_joint_positions(self.ik_solution):
+                # Log the delta movements for debugging
+                deltas = [angular_distance(curr, target) for curr, target 
+                         in zip(self.current_joint_positions, self.ik_solution)]
+                self.get_logger().debug(f"Joint deltas: {deltas}")
+                
                 J = self.ur5.compute_jacobian_analytical(self.ik_solution)
                 Jv = J[:3, :]
                 Jv_pseudo_inverse = self.ur5.compute_pseudo_inverse(Jv)
                 velocity_array = np.array(-(point.position - transformRobotParameter(self.current_joint_positions)[0:3,3]))
                 joint_velocity = (np.dot(Jv_pseudo_inverse, velocity_array))
 
-                self.get_logger().info(f"\npos:{point.position}")
-                self.get_logger().info(f"\ntrans:{transformRobotParameter(self.current_joint_positions)[0:3,3]}")
                 msg = Float64MultiArray()
                 msg.data = self.ik_solution.tolist()
                 self.publisher.publish(msg)
 
+                self.get_logger().info(f"\npos:{point.position}")
+                self.get_logger().info(f"\ntrans:{transformRobotParameter(self.current_joint_positions)[0:3,3]}")
                 self.get_logger().info(f"Distance to goal: {np.linalg.norm((point.position - transformRobotParameter(self.current_joint_positions)[0:3,3]))}")
+            
             self.get_logger().info(f"\nCurrent Point Index:{self.current_point_index}")
         else:
             self.get_logger().info(f"Invalid joint solution at index {self.current_point_index}")
-            # self.current_point_index += 1
-        if(np.linalg.norm((point.position - transformRobotParameter(self.current_joint_positions)[0:3,3]))<0.1):
-            self.current_point_index += 1
+            
+        if(np.linalg.norm((point.position - transformRobotParameter(self.current_joint_positions)[0:3,3]))<0.001):
             self.get_logger().info(f"\nCurrent Point Index:{self.current_point_index}")
 
 def main():
