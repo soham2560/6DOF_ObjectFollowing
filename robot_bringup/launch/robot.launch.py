@@ -162,6 +162,15 @@ def generate_launch_description():
         condition=IfCondition(record)
     )
 
+
+
+    delay_rosbag_recorder = RegisterEventHandler(
+        event_handler=OnProcessExit(
+            target_action=joint_state_broadcaster_spawner,
+            on_exit=[rosbag_recorder]
+        )
+    )
+
     nodes = [
         gz_spawn_entity,
         gazebo,
@@ -170,7 +179,7 @@ def generate_launch_description():
         joint_state_broadcaster_spawner,
         delay_rviz,
         delay_arm_controller,
-        rosbag_recorder
+        delay_rosbag_recorder
     ]
 
     return LaunchDescription(declared_arguments + nodes)

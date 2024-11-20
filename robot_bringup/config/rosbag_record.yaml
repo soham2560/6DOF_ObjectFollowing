@@ -1,3 +1,4 @@
 # List of topics to record in a rosbag
 ---
 topics:
+- --all
